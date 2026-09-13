@@ -1,0 +1,1 @@
+- **Coding style:** Use concise, consistent comments explaining each operation with a concrete value or tensor-shape example that matches the model configuration; split chained operations into clear steps.
