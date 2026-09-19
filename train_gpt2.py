@@ -162,14 +162,15 @@ class GPT(nn.Module):
         self.transformer.wte.weight = self.lm_head.weight
 
         # init params
-        self.apply(self.__init__weights)
+        self.apply(self._init_weights)
 
-    def __init__weights(self, module):
+    def _init_weights(self, module):
         if isinstance(module, nn.Linear):
             std = 0.02
             if hasattr(module, "NANOGPT_SCALE_INIT"):
-                std *= (2*self.config.n_layer) ** -0.5
-            torch.nn.init.normal_(module.weight, mean = 0.0, std = 0.02)
+                # Scale residual projections; e.g. 12 layers give std = 0.02 / sqrt(24).
+                std *= (2 * self.config.n_layer) ** -0.5
+            torch.nn.init.normal_(module.weight, mean=0.0, std=std)
             if module.bias is not None:
                 torch.nn.init.zeros_(module.bias)
         elif isinstance(module, nn.Embedding):
@@ -201,11 +202,15 @@ class GPT(nn.Module):
         x = self.transformer.ln_f(x)
         # Score next-token candidates: (B, T, C) -> (B, T, vocab_size); e.g. (2, 5, 50257).
         logits = self.lm_head(x)
-        loss = None
-        # Return raw scores; e.g. logits[0, 4] contains 50257 scores for the token after position 4.
+        # Skip loss during generation; e.g. model(idx) returns (logits, None).
         loss = None
         if targets is not None:
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
+            # Flatten batch/time into predictions; e.g. (8, 256, 50257) -> (2048, 50257).
+            flat_logits = logits.reshape(-1, logits.size(-1))
+            # Match one correct token ID to each prediction; e.g. (8, 256) -> (2048,).
+            flat_targets = targets.reshape(-1)
+            # Average next-token loss; e.g. uniform predictions give approximately log(50257).
+            loss = F.cross_entropy(flat_logits, flat_targets)
         return logits, loss
 
     # Construct a model from the class; e.g. GPT.from_pretrained("gpt2").
@@ -278,6 +283,16 @@ class GPT(nn.Module):
         # Return only after all tensors are loaded; e.g. all 12 base-model blocks are populated.
         return model
 
+def synchronize_device(device):
+    # Wait for queued accelerator work before timing; e.g. Apple GPU work uses MPS.
+    device_type = torch.device(device).type
+    if device_type == "cuda":
+        torch.cuda.synchronize(device)
+    elif device_type == "mps":
+        torch.mps.synchronize()
+    # CPU operations already complete synchronously, so no wait is needed.
+
+
 def main():
     # Load GPT-2's tokenizer; e.g. text is converted to IDs in the range 0 through 50256.
     import tiktoken
@@ -294,7 +309,9 @@ def main():
             tokens = enc.encode(text)
             self.tokens = torch.tensor(tokens)
             print(f"loaded {len(self.tokens)} tokens")
-            print(f"1 epoch = {len(self.tokens)//(B*T)} batches")
+            if len(self.tokens) < B * T + 1:
+                raise ValueError(f"Need at least {B * T + 1} tokens for one batch")
+            print(f"1 epoch = {(len(self.tokens) - 1) // (B * T)} batches")
 
             # state
             self.current_position = 0
@@ -331,35 +348,39 @@ def main():
     if torch.cuda.is_available():
         torch.cuda.manual_seed(1337)
 
-    train_loader = DataLoaderLite(B=16, T=1024)
+    train_loader = DataLoaderLite(B=8, T=256)
 
 
-    # Load base GPT-2 in evaluation mode; e.g. 12 layers with 768 features per token.
-    # model = GPT.from_pretrained("gpt2")
+    # Initialize GPT-2 for training from scratch; e.g. 12 layers with 768 features per token.
     model = GPT(GPTConfig())
     # Move all parameters and buffers to the chosen device; e.g. CPU -> MPS.
     model.to(device)
-    # logits, loss = model(x, y)
+    model.train()
 
     optimizer = torch.optim.Adam(model.parameters(), lr=3e-4)
     for i in range(50):
-        t0 = time.time()
+        # Finish earlier work before starting the timer; e.g. model transfers on step 0.
+        synchronize_device(device)
+        t0 = time.perf_counter()
         x, y = train_loader.next_batch()
         x, y = x.to(device), y.to(device)
         optimizer.zero_grad()
         logits, loss = model(x, y)
-        import code; code.interact(local=locals())
         loss.backward()
         optimizer.step()
-        torch.cuda.synchronize()
-        t1 = time.time()
+        # Include completed GPU work in elapsed time; e.g. wait for the MPS optimizer step.
+        synchronize_device(device)
+        t1 = time.perf_counter()
         dt = (t1-t0)*1000 # time difference in milliseconds
-        print(f"setp {i}, loss: {loss.item()}, dt: {dt:.2t}ms")
+        print(f"step {i}, loss: {loss.item():.4f}, dt: {dt:.2f}ms")
 
     print(logits.shape)
     print(loss)
-    import sys; sys.exit(0)
+    # Finish this training demo here; remove this return to run the generation example below.
+    return
 
+    # Switch to evaluation mode before sampling the trained model.
+    model.eval()
     # Select the matching token vocabulary; e.g. GPT-2 has 50257 token IDs.
     enc = tiktoken.get_encoding("gpt2")
     # Encode the prompt; its token count T depends on how the tokenizer splits the text.
@@ -380,7 +401,7 @@ def main():
         # Append one token per sequence per step; e.g. a length of 8 grows to 30.
         while x.size(1) < max_length:
             # Score every position: (B, T) -> (B, T, vocab_size); e.g. (5, 8, 50257).
-            logits = model(x)
+            logits, _ = model(x)
             # Keep next-token scores from the final position; e.g. (5, 8, 50257) -> (5, 50257).
             logits = logits[:, -1, :]
             # Convert each row to probabilities; e.g. 50257 probabilities per sequence sum to 1.
