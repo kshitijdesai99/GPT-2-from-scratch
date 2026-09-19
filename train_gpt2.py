@@ -17,6 +17,7 @@ class CausalSelfAttention(nn.Module):
         self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd)
         # Learn how to mix the joined heads; e.g. 768 -> 768 features.
         self.c_proj = nn.Linear(config.n_embd, config.n_embd)
+        self.c_proj.NANOGPT_SCALE_INIT = 1
 
         # Save head count and embedding width; e.g. H=12 and C=768.
         self.n_head = config.n_head
@@ -85,6 +86,7 @@ class MLP(nn.Module):
         self.gelu = nn.GELU(approximate="tanh")
         # Learn a projection back to C features; e.g. 3072 -> 768.
         self.c_proj = nn.Linear(4 * config.n_embd, config.n_embd)
+        self.c_proj.NANOGPT_SCALE_INIT = 1
 
     def forward(self, x):
         # Expand each token's features: (B, T, C) -> (B, T, 4C); e.g. (2, 5, 3072).
@@ -156,7 +158,24 @@ class GPT(nn.Module):
         # Map features to vocabulary scores without an added bias; e.g. (2, 5, 768) -> (2, 5, 50257).
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
 
-    def forward(self, idx):
+        # weight sharing scheme
+        self.transformer.wte.weight = self.lm_head.weight
+
+        # init params
+        self.apply(self.__init__weights)
+
+    def __init__weights(self, module):
+        if isinstance(module, nn.Linear):
+            std = 0.02
+            if hasattr(module, "NANOGPT_SCALE_INIT"):
+                std *= (2*self.config.n_layer) ** -0.5
+            torch.nn.init.normal_(module.weight, mean = 0.0, std = 0.02)
+            if module.bias is not None:
+                torch.nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            torch.nn.init.normal_(module.weight, mean = 0.0, std = 0.02)
+
+    def forward(self, idx, targets = None):
         # Read batch size and token count: (B, T); e.g. 2 sequences of 5 token IDs.
         B, T = idx.size()
         # Reject sequences beyond the context window; e.g. 1025 tokens exceed a limit of 1024.
@@ -182,8 +201,12 @@ class GPT(nn.Module):
         x = self.transformer.ln_f(x)
         # Score next-token candidates: (B, T, C) -> (B, T, vocab_size); e.g. (2, 5, 50257).
         logits = self.lm_head(x)
+        loss = None
         # Return raw scores; e.g. logits[0, 4] contains 50257 scores for the token after position 4.
-        return logits
+        loss = None
+        if targets is not None:
+            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
+        return logits, loss
 
     # Construct a model from the class; e.g. GPT.from_pretrained("gpt2").
     @classmethod
@@ -259,9 +282,41 @@ def main():
     # Load GPT-2's tokenizer; e.g. text is converted to IDs in the range 0 through 50256.
     import tiktoken
 
+    class DataLoaderLite:
+        def __init__(self, B, T):
+            self.B = B
+            self.T = T
+
+            # at init load tokens from disk and store them in memory
+            with open("input.txt","r") as f:
+                text = f.read()
+            enc = tiktoken.get_encoding("gpt2")
+            tokens = enc.encode(text)
+            self.tokens = torch.tensor(tokens)
+            print(f"loaded {len(self.tokens)} tokens")
+            print(f"1 epoch = {len(self.tokens)//(B*T)} batches")
+
+            # state
+            self.current_position = 0
+
+        def next_batch(self):
+            B, T = self.B, self.T
+            buf = self.tokens[self.current_position : self.current_position+B*T+1]
+            x = (buf[:-1]).view(B,T) # inputs
+            y = (buf[1:]).view(B,T) # targets
+            # advance the position in the tensor
+            self.current_position += B*T
+            # if loading the next batch would be out of bounds, reset
+            if self.current_position + (B*T + 1 ) > len(self.tokens):
+                self.current_position = 0
+            return x,y 
+
+
     # Generate 5 independent continuations, each with 30 total tokens including the prompt.
     num_return_sequences = 5
     max_length = 30
+
+    import time
 
     # Use an available accelerator; e.g. MPS on Apple Silicon, otherwise CUDA or CPU.
     if torch.cuda.is_available():
@@ -270,12 +325,40 @@ def main():
         device = "mps"
     else:
         device = "cpu"
+    print(f"using device: {device}")
+
+    torch.manual_seed(1337)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(1337)
+
+    train_loader = DataLoaderLite(B=16, T=1024)
+
 
     # Load base GPT-2 in evaluation mode; e.g. 12 layers with 768 features per token.
     # model = GPT.from_pretrained("gpt2")
     model = GPT(GPTConfig())
     # Move all parameters and buffers to the chosen device; e.g. CPU -> MPS.
     model.to(device)
+    # logits, loss = model(x, y)
+
+    optimizer = torch.optim.Adam(model.parameters(), lr=3e-4)
+    for i in range(50):
+        t0 = time.time()
+        x, y = train_loader.next_batch()
+        x, y = x.to(device), y.to(device)
+        optimizer.zero_grad()
+        logits, loss = model(x, y)
+        import code; code.interact(local=locals())
+        loss.backward()
+        optimizer.step()
+        torch.cuda.synchronize()
+        t1 = time.time()
+        dt = (t1-t0)*1000 # time difference in milliseconds
+        print(f"setp {i}, loss: {loss.item()}, dt: {dt:.2t}ms")
+
+    print(logits.shape)
+    print(loss)
+    import sys; sys.exit(0)
 
     # Select the matching token vocabulary; e.g. GPT-2 has 50257 token IDs.
     enc = tiktoken.get_encoding("gpt2")
