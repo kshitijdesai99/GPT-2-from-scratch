@@ -1,5 +1,4 @@
 from dataclasses import dataclass
-import math
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
@@ -23,15 +22,6 @@ class CausalSelfAttention(nn.Module):
         self.n_head = config.n_head
         self.n_embd = config.n_embd
 
-        # Start with all token pairs allowed; e.g. block_size=3 gives a 3x3 grid of ones.
-        mask = torch.ones(config.block_size, config.block_size)
-        # Keep only current/past tokens; e.g. [[1,0,0], [1,1,0], [1,1,1]].
-        mask = torch.tril(mask)
-        # Add batch/head axes for broadcasting; e.g. (3, 3) -> (1, 1, 3, 3).
-        mask = mask.view(1, 1, config.block_size, config.block_size)
-        # Store a non-trainable mask that moves with the model; e.g. CPU -> GPU.
-        self.register_buffer("bias", mask)
-
     def forward(self, x):
         # Read batch size, token count and feature width; e.g. (2, 5, 768).
         B, T, C = x.size()
@@ -50,22 +40,10 @@ class CausalSelfAttention(nn.Module):
         k = k.transpose(1, 2)
         v = v.transpose(1, 2)
 
-        # Swap key axes for dot products: (B, H, T, D) -> (B, H, D, T); e.g. (2, 12, 64, 5).
-        k_transposed = k.transpose(-2, -1)
-        # Score every query/key pair: (..., T, D) @ (..., D, T) -> (2, 12, 5, 5).
-        att = q @ k_transposed
-        # Scale scores by 1/sqrt(D) to limit their size; e.g. D=64 gives a factor of 1/8.
-        att = att * (1.0 / math.sqrt(k.size(-1)))
+        # Apply causal scaled dot-product attention; e.g. (2, 12, 5, 64) -> (2, 12, 5, 64).
+        # Each token uses only current/past tokens; PyTorch selects the attention backend.
+        y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
 
-        # Crop the mask and mark future positions; e.g. token 0 has [False, True, True, ...].
-        future_tokens = self.bias[:, :, :T, :T] == 0
-        # Replace future scores with -inf; e.g. [2, 1, 3] -> [2, 1, -inf] for token 1.
-        att = att.masked_fill(future_tokens, float("-inf"))
-        # Normalize each row into probabilities; e.g. [2, 1, -inf] -> [0.73, 0.27, 0.0].
-        att = F.softmax(att, dim=-1)
-
-        # Combine values using attention weights: (2, 12, 5, 5) @ (2, 12, 5, 64) -> (2, 12, 5, 64).
-        y = att @ v
         # Move tokens before heads: (B, H, T, D) -> (B, T, H, D); e.g. (2, 5, 12, 64).
         y = y.transpose(1, 2)
         # Copy if needed to make storage contiguous for view; shape stays (2, 5, 12, 64).
@@ -350,14 +328,16 @@ def main():
 
     train_loader = DataLoaderLite(B=8, T=256)
 
+    torch.set_float32_matmul_precision("high")
 
     # Initialize GPT-2 for training from scratch; e.g. 12 layers with 768 features per token.
-    model = GPT(GPTConfig())
+    model = GPT(GPTConfig(vocab_size=50304))
     # Move all parameters and buffers to the chosen device; e.g. CPU -> MPS.
     model.to(device)
     model.train()
+    model = torch.compile(model)
 
-    optimizer = torch.optim.Adam(model.parameters(), lr=3e-4)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, betas=(0.9, 0.95), eps=1e-8)
     for i in range(50):
         # Finish earlier work before starting the timer; e.g. model transfers on step 0.
         synchronize_device(device)
@@ -365,14 +345,21 @@ def main():
         x, y = train_loader.next_batch()
         x, y = x.to(device), y.to(device)
         optimizer.zero_grad()
-        logits, loss = model(x, y)
+        with torch.autocast(device_type=device, dtype=torch.bfloat16):
+            logits, loss = model(x, y)
         loss.backward()
+        norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         optimizer.step()
         # Include completed GPU work in elapsed time; e.g. wait for the MPS optimizer step.
         synchronize_device(device)
         t1 = time.perf_counter()
-        dt = (t1-t0)*1000 # time difference in milliseconds
-        print(f"step {i}, loss: {loss.item():.4f}, dt: {dt:.2f}ms")
+        # Measure seconds for throughput; e.g. 0.5 seconds for 2048 tokens gives 4096 tokens/sec.
+        elapsed_seconds = t1 - t0
+        # Convert only the displayed duration to milliseconds; e.g. 0.5 seconds -> 500 ms.
+        dt = elapsed_seconds * 1000
+        tokens_processed = train_loader.B * train_loader.T
+        tokens_per_sec = tokens_processed / elapsed_seconds
+        print(f"step {i}, loss: {loss.item():.4f}, norm: {norm:.4f}, dt: {dt:.2f}ms, tok/sec: {tokens_per_sec:.2f}")
 
     print(logits.shape)
     print(loss)
@@ -400,10 +387,10 @@ def main():
     with torch.no_grad():
         # Append one token per sequence per step; e.g. a length of 8 grows to 30.
         while x.size(1) < max_length:
-            # Score every position: (B, T) -> (B, T, vocab_size); e.g. (5, 8, 50257).
+            # Score every position: (B, T) -> (B, T, vocab_size); e.g. (5, 8, 50304).
             logits, _ = model(x)
-            # Keep next-token scores from the final position; e.g. (5, 8, 50257) -> (5, 50257).
-            logits = logits[:, -1, :]
+            # Keep final-position scores for valid token IDs; e.g. (5, 8, 50304) -> (5, 50257).
+            logits = logits[:, -1, :enc.n_vocab]
             # Convert each row to probabilities; e.g. 50257 probabilities per sequence sum to 1.
             probs = F.softmax(logits, dim=-1)
             # Keep the 50 most likely tokens and their IDs; e.g. both outputs have shape (5, 50).
