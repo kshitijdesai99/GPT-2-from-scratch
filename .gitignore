@@ -8,3 +8,11 @@ wheels/
 
 # Virtual environments
 .venv
+
+# Generated training data and checkpoints
+edu_fineweb10B/
+checkpoints/
+checkpoints-smoke/
+
+# Local benchmark data
+hellaswag_val.jsonl

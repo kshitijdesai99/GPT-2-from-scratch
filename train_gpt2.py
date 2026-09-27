@@ -1,265 +1,20 @@
-from dataclasses import dataclass
+"""Training entry point: settings, device setup, resume, and optimizer updates.
+
+Start with main() to follow the run. See README.md for the file responsibility map.
+"""
+from contextlib import nullcontext
+import math
 import torch
-import torch.nn as nn
-from torch.nn import functional as F
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
 
+from model import GPT, GPTConfig
+from data_loader import DataLoaderLite
+from evaluation import evaluate
+from checkpoint import save_checkpoint
+from tracking import MetricsLogger
+from hellaswag import load_examples, evaluate_hellaswag
 
-# Shape examples use B=2 sequences, T=5 tokens, C=768 features, H=12 heads, D=64 features/head.
-class CausalSelfAttention(nn.Module):
-    def __init__(self, config):
-        super().__init__()
-
-        # Require equal-sized heads; e.g. 768 features / 12 heads = 64 features/head.
-        assert config.n_embd % config.n_head == 0
-
-        # Learn query, key and value projections together; e.g. 768 -> 2304 features.
-        self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd)
-        # Learn how to mix the joined heads; e.g. 768 -> 768 features.
-        self.c_proj = nn.Linear(config.n_embd, config.n_embd)
-        self.c_proj.NANOGPT_SCALE_INIT = 1
-
-        # Save head count and embedding width; e.g. H=12 and C=768.
-        self.n_head = config.n_head
-        self.n_embd = config.n_embd
-
-    def forward(self, x):
-        # Read batch size, token count and feature width; e.g. (2, 5, 768).
-        B, T, C = x.size()
-
-        # Project to Q, K and V: (B, T, C) -> (B, T, 3C); e.g. (2, 5, 768) -> (2, 5, 2304).
-        qkv = self.c_attn(x)
-        # Split into three C-wide tensors; e.g. Q, K and V each have shape (2, 5, 768).
-        q, k, v = qkv.split(self.n_embd, dim=2)
-
-        # Split each tensor into heads: (B, T, C) -> (B, T, H, D); e.g. (2, 5, 12, 64).
-        q = q.view(B, T, self.n_head, C // self.n_head)
-        k = k.view(B, T, self.n_head, C // self.n_head)
-        v = v.view(B, T, self.n_head, C // self.n_head)
-        # Move heads before tokens: (B, T, H, D) -> (B, H, T, D); e.g. (2, 12, 5, 64).
-        q = q.transpose(1, 2)
-        k = k.transpose(1, 2)
-        v = v.transpose(1, 2)
-
-        # Apply causal scaled dot-product attention; e.g. (2, 12, 5, 64) -> (2, 12, 5, 64).
-        # Each token uses only current/past tokens; PyTorch selects the attention backend.
-        y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
-
-        # Move tokens before heads: (B, H, T, D) -> (B, T, H, D); e.g. (2, 5, 12, 64).
-        y = y.transpose(1, 2)
-        # Copy if needed to make storage contiguous for view; shape stays (2, 5, 12, 64).
-        y = y.contiguous()
-        # Merge heads: (B, T, H, D) -> (B, T, C); e.g. (2, 5, 12, 64) -> (2, 5, 768).
-        y = y.view(B, T, C)
-        # Mix head outputs with a learned projection; e.g. (2, 5, 768) -> (2, 5, 768).
-        y = self.c_proj(y)
-        return y
-
-
-class MLP(nn.Module):
-    def __init__(self, config):
-        super().__init__()
-        # Learn an expansion to 4C features; e.g. 768 -> 3072.
-        self.c_fc = nn.Linear(config.n_embd, 4 * config.n_embd)
-        # Use the tanh approximation of GELU; e.g. -1 -> about -0.159, 1 -> about 0.841.
-        self.gelu = nn.GELU(approximate="tanh")
-        # Learn a projection back to C features; e.g. 3072 -> 768.
-        self.c_proj = nn.Linear(4 * config.n_embd, config.n_embd)
-        self.c_proj.NANOGPT_SCALE_INIT = 1
-
-    def forward(self, x):
-        # Expand each token's features: (B, T, C) -> (B, T, 4C); e.g. (2, 5, 3072).
-        x = self.c_fc(x)
-        # Apply GELU elementwise; e.g. -1 -> about -0.159; shape stays (2, 5, 3072).
-        x = self.gelu(x)
-        # Project back to the embedding width: (B, T, 4C) -> (B, T, C); e.g. (2, 5, 768).
-        x = self.c_proj(x)
-        return x
-
-
-class Block(nn.Module):
-    def __init__(self, config):
-        super().__init__()
-        # Normalize each token over C features before attention; e.g. 768 features/token.
-        self.ln_1 = nn.LayerNorm(config.n_embd)
-        # Let tokens attend to current/past tokens; e.g. token 2 can use tokens 0, 1 and 2.
-        self.attn = CausalSelfAttention(config)
-        # Normalize each token over C features before the MLP; e.g. 768 features/token.
-        self.ln_2 = nn.LayerNorm(config.n_embd)
-        # Transform each token independently; e.g. 768 -> 3072 -> 768 features.
-        self.mlp = MLP(config)
-
-    def forward(self, x):
-        # Normalize token features; e.g. (2, 5, 768) -> (2, 5, 768).
-        normalized = self.ln_1(x)
-        # Compute attention updates; e.g. (2, 5, 768) -> (2, 5, 768).
-        update = self.attn(normalized)
-        # Add the attention residual elementwise; e.g. original 0.5 + update 0.2 = 0.7.
-        x = x + update
-        # Normalize the updated token features; e.g. (2, 5, 768) -> (2, 5, 768).
-        normalized = self.ln_2(x)
-        # Compute MLP updates; e.g. (2, 5, 768) -> (2, 5, 768).
-        update = self.mlp(normalized)
-        # Add the MLP residual elementwise; e.g. original 0.7 + update 0.1 = 0.8.
-        x = x + update
-        return x
-
-
-# Generate a configuration initializer; e.g. GPTConfig(n_layer=2) overrides just the depth.
-@dataclass
-class GPTConfig:
-    block_size: int = 1024  # Maximum context length; e.g. positions 0 through 1023.
-    vocab_size: int = 50257  # Number of token IDs; e.g. IDs 0 through 50256.
-    n_layer: int = 12  # Transformer depth; e.g. 12 consecutive blocks.
-    n_head: int = 12  # Heads per attention layer; e.g. 768 / 12 = 64 features/head.
-    n_embd: int = 768  # Embedding width; e.g. each token becomes a vector of 768 numbers.
-
-
-class GPT(nn.Module):
-    def __init__(self, config):
-        super().__init__()
-        # Keep model settings available; e.g. self.config.block_size is 1024.
-        self.config = config
-
-        # Register named submodules; e.g. transformer.wte accesses the token embedding table.
-        self.transformer = nn.ModuleDict(
-            dict(
-                # Look up token vectors; e.g. 50257 IDs map to rows of a (50257, 768) table.
-                wte=nn.Embedding(config.vocab_size, config.n_embd),
-                # Look up position vectors; e.g. 1024 positions map to a (1024, 768) table.
-                wpe=nn.Embedding(config.block_size, config.n_embd),
-                # Register independently initialized blocks; e.g. 12 blocks with separate weights.
-                h=nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
-                # Normalize final token features; e.g. (2, 5, 768) -> (2, 5, 768).
-                ln_f=nn.LayerNorm(config.n_embd),
-            )
-        )
-        # Map features to vocabulary scores without an added bias; e.g. (2, 5, 768) -> (2, 5, 50257).
-        self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
-
-        # weight sharing scheme
-        self.transformer.wte.weight = self.lm_head.weight
-
-        # init params
-        self.apply(self._init_weights)
-
-    def _init_weights(self, module):
-        if isinstance(module, nn.Linear):
-            std = 0.02
-            if hasattr(module, "NANOGPT_SCALE_INIT"):
-                # Scale residual projections; e.g. 12 layers give std = 0.02 / sqrt(24).
-                std *= (2 * self.config.n_layer) ** -0.5
-            torch.nn.init.normal_(module.weight, mean=0.0, std=std)
-            if module.bias is not None:
-                torch.nn.init.zeros_(module.bias)
-        elif isinstance(module, nn.Embedding):
-            torch.nn.init.normal_(module.weight, mean = 0.0, std = 0.02)
-
-    def forward(self, idx, targets = None):
-        # Read batch size and token count: (B, T); e.g. 2 sequences of 5 token IDs.
-        B, T = idx.size()
-        # Reject sequences beyond the context window; e.g. 1025 tokens exceed a limit of 1024.
-        if T > self.config.block_size:
-            raise ValueError(
-                f"Cannot forward sequence of length {T}; block size is {self.config.block_size}"
-            )
-
-        # Create positions on the input device: (T,); e.g. [0, 1, 2, 3, 4].
-        pos = torch.arange(0, T, dtype=torch.long, device=idx.device)
-        # Look up position vectors: (T,) -> (T, C); e.g. (5,) -> (5, 768).
-        pos_emb = self.transformer.wpe(pos)
-        # Look up token vectors: (B, T) -> (B, T, C); e.g. (2, 5) -> (2, 5, 768).
-        tok_emb = self.transformer.wte(idx)
-        # Add positions across every batch item: (2, 5, 768) + (5, 768) -> (2, 5, 768).
-        x = tok_emb + pos_emb
-
-        # Apply each transformer block in order; e.g. 12 blocks each preserve (2, 5, 768).
-        for block in self.transformer.h:
-            x = block(x)
-
-        # Normalize each token's features: (B, T, C) -> (B, T, C); e.g. (2, 5, 768).
-        x = self.transformer.ln_f(x)
-        # Score next-token candidates: (B, T, C) -> (B, T, vocab_size); e.g. (2, 5, 50257).
-        logits = self.lm_head(x)
-        # Skip loss during generation; e.g. model(idx) returns (logits, None).
-        loss = None
-        if targets is not None:
-            # Flatten batch/time into predictions; e.g. (8, 256, 50257) -> (2048, 50257).
-            flat_logits = logits.reshape(-1, logits.size(-1))
-            # Match one correct token ID to each prediction; e.g. (8, 256) -> (2048,).
-            flat_targets = targets.reshape(-1)
-            # Average next-token loss; e.g. uniform predictions give approximately log(50257).
-            loss = F.cross_entropy(flat_logits, flat_targets)
-        return logits, loss
-
-    # Construct a model from the class; e.g. GPT.from_pretrained("gpt2").
-    @classmethod
-    def from_pretrained(cls, model_type):
-        """Load an original GPT-2 checkpoint from Hugging Face into this model."""
-        # Match each checkpoint's architecture; e.g. gpt2 uses 12 layers, 12 heads and 768 features.
-        model_configs = {
-            "gpt2": dict(n_layer=12, n_head=12, n_embd=768),
-            "gpt2-medium": dict(n_layer=24, n_head=16, n_embd=1024),
-            "gpt2-large": dict(n_layer=36, n_head=20, n_embd=1280),
-            "gpt2-xl": dict(n_layer=48, n_head=25, n_embd=1600),
-        }
-        # Reject unsupported names explicitly; e.g. "gpt3" raises ValueError.
-        if model_type not in model_configs:
-            raise ValueError(f"Unsupported model type {model_type!r}; choose from {tuple(model_configs)}")
-
-        # Import the checkpoint loader only when needed; e.g. ordinary GPT(config) skips this import.
-        from transformers import GPT2LMHeadModel
-
-        # Fix checkpoint vocabulary/context sizes; e.g. 50257 token IDs and 1024 positions.
-        config = GPTConfig(vocab_size=50257, block_size=1024, **model_configs[model_type])
-        # Build the calling class; e.g. a GPT subclass receives an instance of itself.
-        model = cls(config)
-        # Share token/output weights as in GPT-2; e.g. both use the same (50257, 768) parameter.
-        model.lm_head.weight = model.transformer.wte.weight
-        # Access destination tensors by name; e.g. "transformer.h.0.attn.c_attn.weight".
-        state_dict = model.state_dict()
-
-        # Fetch the checkpoint or reuse its local cache; e.g. "gpt2" loads the base model.
-        model_hf = GPT2LMHeadModel.from_pretrained(model_type)
-        # Access pretrained tensors by the same names; e.g. "transformer.wte.weight".
-        pretrained_state = model_hf.state_dict()
-
-        # Ignore generated attention buffers; e.g. keep our causal mask instead of copying it.
-        mask_suffixes = (".attn.bias", ".attn.masked_bias")
-        model_keys = {key for key in state_dict if not key.endswith(mask_suffixes)}
-        pretrained_keys = {key for key in pretrained_state if not key.endswith(mask_suffixes)}
-        # Compare names, not just counts; e.g. a missing ln_f.weight fails before copying.
-        if model_keys != pretrained_keys:
-            missing = sorted(model_keys - pretrained_keys)
-            unexpected = sorted(pretrained_keys - model_keys)
-            raise ValueError(f"Checkpoint keys differ: missing={missing}, unexpected={unexpected}")
-
-        # Hugging Face Conv1D stores these matrices in reverse order; e.g. (768, 2304) vs (2304, 768).
-        transposed_weights = (
-            "attn.c_attn.weight",
-            "attn.c_proj.weight",
-            "mlp.c_fc.weight",
-            "mlp.c_proj.weight",
-        )
-        # Copy without recording gradients; e.g. loading weights adds no training graph.
-        with torch.no_grad():
-            for key in sorted(model_keys):
-                # Select the source tensor; e.g. token embeddings have shape (50257, 768).
-                weight = pretrained_state[key]
-                # Convert Conv1D to Linear layout; e.g. QKV (768, 2304) -> (2304, 768).
-                if key.endswith(transposed_weights):
-                    weight = weight.t()
-                # Require matching dimensions; e.g. a 1024-wide embedding cannot fill a 768-wide one.
-                if weight.shape != state_dict[key].shape:
-                    raise ValueError(
-                        f"Shape mismatch for {key}: {tuple(weight.shape)} != {tuple(state_dict[key].shape)}"
-                    )
-                # Replace initialized values in place; e.g. copy every layer's learned weights.
-                state_dict[key].copy_(weight)
-
-        # Set all modules to evaluation mode; e.g. model.training becomes False.
-        model.eval()
-        # Return only after all tensors are loaded; e.g. all 12 base-model blocks are populated.
-        return model
 
 def synchronize_device(device):
     # Wait for queued accelerator work before timing; e.g. Apple GPU work uses MPS.
@@ -270,149 +25,221 @@ def synchronize_device(device):
         torch.mps.synchronize()
     # CPU operations already complete synchronously, so no wait is needed.
 
+@torch.compile
+def clip_gradients(grads):
+    # combine gradient norms into one global norm
+    norms = torch.stack([torch.linalg.vector_norm(g) for g in grads])
+    total_norm = torch.linalg.vector_norm(norms)
+
+    # Limit the norm to 1; e.g. norm = 2 gives scale = 0.5
+    scale = torch.clamp(1.0/(total_norm + 1e-6), max=1.0)
+    for grad in grads:
+        grad.mul_(scale)
+    return total_norm
+
+
+def get_lr(step, args):
+    # Warm up to max_lr, then decay across the full run even during a short smoke test.
+    if step < args.warmup_steps:
+        return args.max_lr * (step + 1) / args.warmup_steps
+    ratio = (step - args.warmup_steps) / (args.max_steps - args.warmup_steps)
+    ratio = min(max(ratio, 0.0), 1.0)
+    coefficient = 0.5 * (1.0 + math.cos(math.pi * ratio))
+    min_lr = args.max_lr * 0.1
+    return min_lr + coefficient * (args.max_lr - min_lr)
+
+
+def parse_args():
+    import argparse
+    from pathlib import Path
+
+    parser = argparse.ArgumentParser(description="Train GPT-2 on raw FineWeb-Edu uint16 shards")
+    parser.add_argument("--data-dir", type=Path, default=Path(__file__).parent / "edu_fineweb10B")
+    parser.add_argument("--out-dir", type=Path, default=Path(__file__).parent / "checkpoints")
+    parser.add_argument("--resume", type=Path, help="Path to a checkpoint written by this script")
+    parser.add_argument("--batch-size", type=int, default=64, help="Sequences per GPU")
+    parser.add_argument("--sequence-length", type=int, default=1024)
+    parser.add_argument("--total-batch-size", type=int, default=524288, help="Tokens per global optimizer step")
+    parser.add_argument("--max-steps", type=int, default=19073, help="Total schedule length, including resumed steps")
+    parser.add_argument("--warmup-steps", type=int, default=715)
+    parser.add_argument("--max-lr", type=float, default=6e-4)
+    parser.add_argument("--val-every", type=int, default=100)
+    parser.add_argument("--val-batches", type=int, default=20)
+    parser.add_argument("--hellaswag-file", type=Path, help="Local labeled validation JSONL; omitted disables HellaSwag")
+    parser.add_argument("--hellaswag-every", type=int, default=250)
+    parser.add_argument("--save-every", type=int, default=250)
+    parser.add_argument("--run-steps", type=int, help="Stop and checkpoint after this many updates without shortening the LR schedule")
+    parser.add_argument("--no-compile", action="store_true", help="Disable compilation for troubleshooting")
+    args = parser.parse_args()
+    for name in ("batch_size", "sequence_length", "total_batch_size", "max_steps", "val_every", "val_batches", "save_every", "hellaswag_every"):
+        if getattr(args, name) <= 0:
+            parser.error(f"--{name.replace('_', '-')} must be positive")
+    if not 0 <= args.warmup_steps < args.max_steps:
+        parser.error("warmup steps must be between 0 and max_steps - 1")
+    if not math.isfinite(args.max_lr) or args.max_lr <= 0:
+        parser.error("max_lr must be finite and positive")
+    if args.sequence_length > GPTConfig.block_size:
+        parser.error("sequence length exceeds the model context window")
+    if args.run_steps is not None and args.run_steps <= 0:
+        parser.error("--run-steps must be positive")
+    return args
+
 
 def main():
-    # Load GPT-2's tokenizer; e.g. text is converted to IDs in the range 0 through 50256.
-    import tiktoken
-
-    class DataLoaderLite:
-        def __init__(self, B, T):
-            self.B = B
-            self.T = T
-
-            # at init load tokens from disk and store them in memory
-            with open("input.txt","r") as f:
-                text = f.read()
-            enc = tiktoken.get_encoding("gpt2")
-            tokens = enc.encode(text)
-            self.tokens = torch.tensor(tokens)
-            print(f"loaded {len(self.tokens)} tokens")
-            if len(self.tokens) < B * T + 1:
-                raise ValueError(f"Need at least {B * T + 1} tokens for one batch")
-            print(f"1 epoch = {(len(self.tokens) - 1) // (B * T)} batches")
-
-            # state
-            self.current_position = 0
-
-        def next_batch(self):
-            B, T = self.B, self.T
-            buf = self.tokens[self.current_position : self.current_position+B*T+1]
-            x = (buf[:-1]).view(B,T) # inputs
-            y = (buf[1:]).view(B,T) # targets
-            # advance the position in the tensor
-            self.current_position += B*T
-            # if loading the next batch would be out of bounds, reset
-            if self.current_position + (B*T + 1 ) > len(self.tokens):
-                self.current_position = 0
-            return x,y 
-
-
-    # Generate 5 independent continuations, each with 30 total tokens including the prompt.
-    num_return_sequences = 5
-    max_length = 30
-
+    import os
     import time
 
-    # Use an available accelerator; e.g. MPS on Apple Silicon, otherwise CUDA or CPU.
-    if torch.cuda.is_available():
-        device = "cuda"
-    elif torch.backends.mps.is_available():
-        device = "mps"
+    # 1. Read settings and assign one process to each GPU.
+    args = parse_args()
+    ddp = int(os.environ.get("RANK", -1)) != -1
+    if ddp:
+        if not torch.cuda.is_available():
+            raise RuntimeError("The torchrun training path requires CUDA/NCCL")
+        rank = int(os.environ["RANK"])
+        local_rank = int(os.environ["LOCAL_RANK"])
+        world_size = int(os.environ["WORLD_SIZE"])
+        device = f"cuda:{local_rank}"
+        torch.cuda.set_device(device)
+        dist.init_process_group(backend="nccl")
     else:
-        device = "cpu"
-    print(f"using device: {device}")
+        rank, local_rank, world_size = 0, 0, 1
+        device = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
+    device_type = torch.device(device).type
+    master_process = rank == 0
+    logger = None
 
-    torch.manual_seed(1337)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed(1337)
+    try:
+        # 2. Create data loaders and check the global batch size.
+        global_microbatch = args.batch_size * args.sequence_length * world_size
+        if args.total_batch_size % global_microbatch:
+            raise ValueError("total_batch_size must be divisible by batch_size * sequence_length * world_size")
+        grad_accum_steps = args.total_batch_size // global_microbatch
+        # Resume requires the same batch layout/schedule to preserve data order and LR progression.
+        run_config = {name: getattr(args, name) for name in (
+            "batch_size", "sequence_length", "total_batch_size", "max_steps", "warmup_steps", "max_lr"
+        )}
+        run_config.update(world_size=world_size, device_type=device_type)
+        if master_process:
+            print(f"device: {device}; world_size: {world_size}; accumulation: {grad_accum_steps}", flush=True)
+        train_loader = DataLoaderLite(args.batch_size, args.sequence_length, rank, world_size, args.data_dir, "train")
+        val_loader = DataLoaderLite(args.batch_size, args.sequence_length, rank, world_size, args.data_dir, "val")
 
-    train_loader = DataLoaderLite(B=8, T=256)
+        hellaswag_examples = load_examples(args.hellaswag_file) if args.hellaswag_file else None
 
-    torch.set_float32_matmul_precision("high")
+        # 3. Build the model and restore a checkpoint when resuming.
+        torch.manual_seed(1337)
+        torch.set_float32_matmul_precision("high")
+        checkpoint = None
+        start_step = 0
+        config = GPTConfig(vocab_size=50304)
+        if args.resume:
+            # Load only tensors and basic containers; no arbitrary checkpoint objects are needed.
+            checkpoint = torch.load(args.resume, map_location="cpu", weights_only=True)
+            if checkpoint.get("version") != 1 or checkpoint["run_config"] != run_config:
+                raise ValueError("Checkpoint version or training batch/schedule/device settings do not match")
+            if checkpoint["model_config"] != vars(config):
+                raise ValueError("Checkpoint model configuration does not match")
+            start_step = checkpoint["step"]
+            if not 0 <= start_step <= args.max_steps or len(checkpoint["rng_states"]) != world_size:
+                raise ValueError("Checkpoint has an invalid step or rank count")
+            train_loader.load_state_dict(checkpoint["loader"])
+        elif (args.out_dir / "latest.pt").exists():
+            raise FileExistsError("Output checkpoint already exists; use --resume or a different --out-dir")
 
-    # Initialize GPT-2 for training from scratch; e.g. 12 layers with 768 features per token.
-    model = GPT(GPTConfig(vocab_size=50304))
-    # Move all parameters and buffers to the chosen device; e.g. CPU -> MPS.
-    model.to(device)
-    model.train()
-    model = torch.compile(model)
+        if master_process:
+            logger = MetricsLogger(args.out_dir, start_step if args.resume else None)
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, betas=(0.9, 0.95), eps=1e-8)
-    for i in range(50):
-        # Finish earlier work before starting the timer; e.g. model transfers on step 0.
-        synchronize_device(device)
-        t0 = time.perf_counter()
-        x, y = train_loader.next_batch()
-        x, y = x.to(device), y.to(device)
-        optimizer.zero_grad()
-        with torch.autocast(device_type=device, dtype=torch.bfloat16):
-            logits, loss = model(x, y)
-        loss.backward()
-        norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-        optimizer.step()
-        # Include completed GPU work in elapsed time; e.g. wait for the MPS optimizer step.
-        synchronize_device(device)
-        t1 = time.perf_counter()
-        # Measure seconds for throughput; e.g. 0.5 seconds for 2048 tokens gives 4096 tokens/sec.
-        elapsed_seconds = t1 - t0
-        # Convert only the displayed duration to milliseconds; e.g. 0.5 seconds -> 500 ms.
-        dt = elapsed_seconds * 1000
-        tokens_processed = train_loader.B * train_loader.T
-        tokens_per_sec = tokens_processed / elapsed_seconds
-        print(f"step {i}, loss: {loss.item():.4f}, norm: {norm:.4f}, dt: {dt:.2f}ms, tok/sec: {tokens_per_sec:.2f}")
+        raw_model = GPT(config).to(device).train()
+        if checkpoint:
+            raw_model.load_state_dict(checkpoint["model"])
+        optimizer = raw_model.configure_optimizers(0.1, args.max_lr, device, master_process)
+        if checkpoint:
+            optimizer.load_state_dict(checkpoint["optimizer"])
+        model = DDP(raw_model, device_ids=[local_rank]) if ddp else raw_model
+        if not args.no_compile:
+            model = torch.compile(model)
+        # Use the tested compiled clipping path unless compilation is explicitly disabled.
+        clip = clip_gradients.__wrapped__ if args.no_compile else clip_gradients
+        if checkpoint:
+            rng = checkpoint["rng_states"][rank]
+            torch.set_rng_state(rng["cpu"])
+            if device_type == "cuda":
+                torch.cuda.set_rng_state(rng["cuda"], device)
+            elif device_type == "mps":
+                torch.mps.set_rng_state(rng["mps"])
+            del checkpoint
 
-    print(logits.shape)
-    print(loss)
-    # Finish this training demo here; remove this return to run the generation example below.
-    return
+        # 4. Evaluate before training to record the starting performance.
+        stop_step = min(args.max_steps, start_step + args.run_steps) if args.run_steps else args.max_steps
+        val_loss = evaluate(model, val_loader, device, args.val_batches, ddp, world_size)
+        if master_process:
+            print(f"validation step {start_step}: loss {val_loss:.4f}", flush=True)
+            logger.log(start_step, "val", loss=val_loss)
+        if hellaswag_examples is not None:
+            scores = evaluate_hellaswag(raw_model, hellaswag_examples, device, rank, world_size, ddp)
+            if master_process:
+                print(f"hellaswag step {start_step}: {scores}", flush=True)
+                logger.log(start_step, "hellaswag", **scores)
+        # 5. Accumulate gradients, update weights, then save/evaluate when due.
+        for step in range(start_step, stop_step):
+            synchronize_device(device)
+            t0 = time.perf_counter()
+            optimizer.zero_grad(set_to_none=True)
+            loss_accum = torch.zeros((), device=device)
+            for micro_step in range(grad_accum_steps):
+                x, y = train_loader.next_batch()
+                sync = model.no_sync() if ddp and micro_step < grad_accum_steps - 1 else nullcontext()
+                with sync:
+                    with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
+                        _, loss = model(x.to(device), y.to(device))
+                    loss = loss / grad_accum_steps
+                    loss_accum += loss.detach()
+                    loss.backward()
+            if ddp:
+                dist.all_reduce(loss_accum, op=dist.ReduceOp.SUM)
+                loss_accum /= world_size
+            with torch.no_grad():
+                norm = clip([p.grad for p in raw_model.parameters() if p.grad is not None])
+            # Check the synchronized loss/gradient norm before corrupting parameters with NaNs.
+            if not torch.isfinite(loss_accum).item() or not torch.isfinite(norm).item():
+                raise FloatingPointError(f"Non-finite loss or gradient norm at step {step}")
+            lr = get_lr(step, args)
+            for group in optimizer.param_groups:
+                group["lr"] = lr
+            optimizer.step()
+            synchronize_device(device)
+            elapsed = torch.tensor(time.perf_counter() - t0, device=device, dtype=torch.float32)
+            if ddp:
+                # Global throughput uses the slowest rank, not just rank 0's local duration.
+                dist.all_reduce(elapsed, op=dist.ReduceOp.MAX)
+            if master_process:
+                seconds = elapsed.item()
+                print(f"step {step + 1}, loss: {loss_accum.item():.4f}, lr: {lr:.6g}, norm: {norm.item():.4f}, "
+                      f"dt: {seconds * 1000:.2f}ms, tok/sec: {args.total_batch_size / seconds:.2f}", flush=True)
+                logger.log(step + 1, "train", loss=loss_accum.item(), lr=lr, grad_norm=norm.item(),
+                           step_ms=seconds * 1000, tokens_per_sec=args.total_batch_size / seconds)
+            completed = step + 1
+            if completed % args.save_every == 0 or completed == stop_step:
+                save_checkpoint(args.out_dir / "latest.pt", raw_model, optimizer, train_loader,
+                                completed, run_config, device, ddp, rank, world_size)
+            if completed % args.val_every == 0 or completed == stop_step:
+                val_loss = evaluate(model, val_loader, device, args.val_batches, ddp, world_size)
+                if master_process:
+                    print(f"validation step {completed}: loss {val_loss:.4f}", flush=True)
+                    logger.log(completed, "val", loss=val_loss)
+            if hellaswag_examples is not None and (completed % args.hellaswag_every == 0 or completed == stop_step):
+                scores = evaluate_hellaswag(raw_model, hellaswag_examples, device, rank, world_size, ddp)
+                if master_process:
+                    print(f"hellaswag step {completed}: {scores}", flush=True)
+                    logger.log(completed, "hellaswag", **scores)
+    finally:
+        try:
+            if logger is not None:
+                logger.close()
+        finally:
+            if ddp and dist.is_initialized():
+                dist.destroy_process_group()
 
-    # Switch to evaluation mode before sampling the trained model.
-    model.eval()
-    # Select the matching token vocabulary; e.g. GPT-2 has 50257 token IDs.
-    enc = tiktoken.get_encoding("gpt2")
-    # Encode the prompt; its token count T depends on how the tokenizer splits the text.
-    tokens = enc.encode("Where is Taj mahal located?")
-    # Store IDs as integers: (T,); e.g. 8 prompt tokens would give shape (8,).
-    tokens = torch.tensor(tokens, dtype=torch.long)
-    # Add a batch axis: (T,) -> (1, T); e.g. (8,) -> (1, 8).
-    tokens = tokens.unsqueeze(0)
-    # Copy the prompt for each continuation: (1, T) -> (5, T); e.g. (5, 8).
-    tokens = tokens.repeat(num_return_sequences, 1)
-    # Place inputs on the model's device; e.g. (5, 8) on MPS.
-    x = tokens.to(device)
 
-    # Seed sampling on all devices; e.g. repeat runs on the same setup start from seed 42.
-    torch.manual_seed(42)
-    # Generate without tracking gradients; e.g. no backward graph is stored for these tokens.
-    with torch.no_grad():
-        # Append one token per sequence per step; e.g. a length of 8 grows to 30.
-        while x.size(1) < max_length:
-            # Score every position: (B, T) -> (B, T, vocab_size); e.g. (5, 8, 50304).
-            logits, _ = model(x)
-            # Keep final-position scores for valid token IDs; e.g. (5, 8, 50304) -> (5, 50257).
-            logits = logits[:, -1, :enc.n_vocab]
-            # Convert each row to probabilities; e.g. 50257 probabilities per sequence sum to 1.
-            probs = F.softmax(logits, dim=-1)
-            # Keep the 50 most likely tokens and their IDs; e.g. both outputs have shape (5, 50).
-            topk_probs, topk_indices = torch.topk(probs, 50, dim=-1)
-            # Sample a slot using relative weights; e.g. slot 7 of the top 50, shape (5, 1).
-            sampled_slots = torch.multinomial(topk_probs, 1)
-            # Map sampled slots back to vocabulary IDs; e.g. slot 7 -> token ID 262.
-            next_tokens = torch.gather(topk_indices, -1, sampled_slots)
-            # Append each selected ID: (B, T) + (B, 1) -> (B, T+1); e.g. (5, 9).
-            x = torch.cat((x, next_tokens), dim=1)
-
-    # Move generated IDs to CPU for decoding; e.g. a (5, 30) tensor on CPU.
-    sequences = x.cpu()
-    for sequence in sequences:
-        # Convert one sequence to a Python list; e.g. 30 integer token IDs.
-        token_ids = sequence.tolist()
-        # Decode IDs to text, including the prompt; e.g. token ID 262 decodes to " the".
-        text = enc.decode(token_ids)
-        # Display each continuation on its own line; e.g. 5 generated answers.
-        print(text)
-
-
-# Run generation only when executed directly; e.g. importing GPT does not download a checkpoint.
 if __name__ == "__main__":
     main()
