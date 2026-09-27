@@ -101,3 +101,7 @@ ending likelihood accuracy (`accuracy_norm`), excluding context and padding.
 This follows [Karpathy's completion-style scoring](https://github.com/karpathy/build-nanogpt/blob/master/hellaswag.py),
 which is not directly interchangeable with other evaluation harnesses.
 Omit `--hellaswag-file` for a training smoke test without benchmark evaluation.
+
+## Experiment results
+
+See [the two-H100 experiment summary](EXPERIMENTS.md) for measured throughput, loss, HellaSwag scores, and conclusions.
